@@ -506,20 +506,46 @@ impl WebView {
 
     #[func]
     fn resize(&self) {
+        let (x, y, w, h) = if self.full_window_size {
+            let viewport_size = self.base().get_tree().expect("Could not get tree").get_root().expect("Could not get viewport").get_size();
+            (0, 0, viewport_size.x, viewport_size.y)
+        } else {
+            let pos = self.base().get_screen_position();
+            let size = self.base().get_size();
+            (pos.x as i32, pos.y as i32, size.x as i32, size.y as i32)
+        };
+
+        #[cfg(target_os = "android")]
+        {
+            // Godot の get_screen_position/get_size は content-scale 済みの論理座標。
+            // Android DecorView はデバイスピクセル。
+            // window_get_size (物理) / visible_rect (論理) でスケール算出
+            let ds = DisplayServer::singleton();
+            let win_size = ds.window_get_size();
+            let vp_size = self.base().get_viewport().expect("viewport")
+                .get_visible_rect().size;
+            let scale_x = win_size.x as f32 / vp_size.x as f32;
+            let scale_y = win_size.y as f32 / vp_size.y as f32;
+
+            let px = (x as f32 * scale_x) as i32;
+            let py = (y as f32 * scale_y) as i32;
+            let pw = (w as f32 * scale_x) as i32;
+            let ph = (h as f32 * scale_y) as i32;
+            godot_print!("[Godot WRY] resize: godot=({x},{y},{w},{h}) win=({},{}) vp=({},{}) scale=({scale_x},{scale_y}) px=({px},{py},{pw},{ph})",
+                win_size.x, win_size.y, vp_size.x, vp_size.y);
+
+            use jni::objects::JValue;
+            android_bridge_call("setBounds", "(IIII)V", &[
+                JValue::Int(px), JValue::Int(py), JValue::Int(pw), JValue::Int(ph),
+            ]);
+            return;
+        }
+
+        #[cfg(not(target_os = "android"))]
         if let Some(webview) = &self.webview {
-            let rect = if self.full_window_size {
-                let viewport_size = self.base().get_tree().expect("Could not get tree").get_root().expect("Could not get viewport").get_size();
-                Rect {
-                    position: PhysicalPosition::new(0, 0).into(),
-                    size: PhysicalSize::new(viewport_size.x, viewport_size.y).into(),
-                }
-            } else {
-                let pos = self.base().get_screen_position();
-                let size = self.base().get_size();
-                Rect {
-                    position: PhysicalPosition::new(pos.x, pos.y).into(),
-                    size: PhysicalSize::new(size.x, size.y).into(),
-                }
+            let rect = Rect {
+                position: PhysicalPosition::new(x, y).into(),
+                size: PhysicalSize::new(w, h).into(),
             };
             let _ = webview.set_bounds(rect);
         }
@@ -543,6 +569,14 @@ impl WebView {
 
     #[func]
     fn set_visible(&self, visibility: bool) {
+        #[cfg(target_os = "android")]
+        {
+            use jni::objects::JValue;
+            android_bridge_call("setVisible", "(Z)V", &[JValue::Bool(visibility as u8)]);
+            return;
+        }
+
+        #[cfg(not(target_os = "android"))]
         if let Some(webview) = &self.webview {
             let _ = webview.set_visible(visibility);
         }
@@ -564,6 +598,21 @@ impl WebView {
             url_str = format!("http://res.{}", path);
         }
 
+        #[cfg(target_os = "android")]
+        {
+            if let Some(state) = ANDROID_BRIDGE.get() {
+                if let Ok(mut env) = state.vm.attach_current_thread() {
+                    let cls = unsafe { jni::objects::JClass::from_raw(state.bridge_class.as_raw()) };
+                    if let Ok(jurl) = env.new_string(&url_str) {
+                        let _ = env.call_static_method(cls, "loadUrl",
+                            "(Ljava/lang/String;)V", &[(&jurl).into()]);
+                    }
+                }
+            }
+            return;
+        }
+
+        #[cfg(not(target_os = "android"))]
         if let Some(webview) = &self.webview {
             let _ = webview.load_url(&url_str);
         }
@@ -636,6 +685,32 @@ impl WebView {
 
 #[cfg(target_os = "android")]
 static WRY_BRIDGE_DEX: &[u8] = include_bytes!("wry_bridge.dex");
+
+#[cfg(target_os = "android")]
+static ANDROID_BRIDGE: std::sync::OnceLock<AndroidBridgeState> = std::sync::OnceLock::new();
+
+#[cfg(target_os = "android")]
+struct AndroidBridgeState {
+    vm: jni::JavaVM,
+    bridge_class: jni::objects::GlobalRef,
+}
+
+#[cfg(target_os = "android")]
+unsafe impl Send for AndroidBridgeState {}
+#[cfg(target_os = "android")]
+unsafe impl Sync for AndroidBridgeState {}
+
+#[cfg(target_os = "android")]
+fn android_bridge_call(method: &str, sig: &str, args: &[jni::objects::JValue]) {
+    if let Some(state) = ANDROID_BRIDGE.get() {
+        if let Ok(mut env) = state.vm.attach_current_thread() {
+            let cls = unsafe { jni::objects::JClass::from_raw(state.bridge_class.as_raw()) };
+            if let Err(e) = env.call_static_method(cls, method, sig, args) {
+                godot_error!("[Godot WRY] Android bridge call {method} failed: {e}");
+            }
+        }
+    }
+}
 
 /// Android: JVM + Activity を取得するヘルパー
 #[cfg(target_os = "android")]
@@ -732,56 +807,63 @@ fn get_android_jvm_and_activity() -> Result<(jni::JavaVM, jni::objects::GlobalRe
 #[cfg(target_os = "android")]
 fn create_android_webview(url: &str) -> Result<(), String> {
     let (vm, activity_ref) = get_android_jvm_and_activity()?;
-    let mut env = vm.attach_current_thread()
-        .map_err(|e| format!("Failed to attach thread: {e}"))?;
 
-    // DEX をメモリから読み込み (InMemoryDexClassLoader, API 26+)
-    let dex_buf = unsafe {
-        env.new_direct_byte_buffer(
-            std::mem::transmute::<*const u8, *mut u8>(WRY_BRIDGE_DEX.as_ptr()),
-            WRY_BRIDGE_DEX.len(),
-        )
-    }.map_err(|e| format!("Failed to create ByteBuffer: {e}"))?;
+    let global_class = {
+        let mut env = vm.attach_current_thread()
+            .map_err(|e| format!("Failed to attach thread: {e}"))?;
 
-    let parent_cl_class = env.find_class("java/lang/ClassLoader")
-        .map_err(|e| format!("ClassLoader not found: {e}"))?;
-    let parent_cl = env.call_static_method(&parent_cl_class, "getSystemClassLoader",
-        "()Ljava/lang/ClassLoader;", &[])
-        .map_err(|e| format!("getSystemClassLoader failed: {e}"))?.l()
-        .map_err(|e| format!("Failed to get ClassLoader: {e}"))?;
+        // DEX をメモリから読み込み (InMemoryDexClassLoader, API 26+)
+        let dex_buf = unsafe {
+            env.new_direct_byte_buffer(
+                std::mem::transmute::<*const u8, *mut u8>(WRY_BRIDGE_DEX.as_ptr()),
+                WRY_BRIDGE_DEX.len(),
+            )
+        }.map_err(|e| format!("Failed to create ByteBuffer: {e}"))?;
 
-    let dex_cl_class = env.find_class("dalvik/system/InMemoryDexClassLoader")
-        .map_err(|e| format!("InMemoryDexClassLoader not found: {e}"))?;
-    let dex_cl = env.new_object(&dex_cl_class,
-        "(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V",
-        &[(&dex_buf).into(), (&parent_cl).into()])
-        .map_err(|e| format!("Failed to create DexClassLoader: {e}"))?;
+        let parent_cl_class = env.find_class("java/lang/ClassLoader")
+            .map_err(|e| format!("ClassLoader not found: {e}"))?;
+        let parent_cl = env.call_static_method(&parent_cl_class, "getSystemClassLoader",
+            "()Ljava/lang/ClassLoader;", &[])
+            .map_err(|e| format!("getSystemClassLoader failed: {e}"))?.l()
+            .map_err(|e| format!("Failed to get ClassLoader: {e}"))?;
 
-    // WryBridge クラスをロード
-    let bridge_name = env.new_string("org.nicetry.wry.WryBridge")
-        .map_err(|e| format!("Failed to create string: {e}"))?;
-    let bridge_class = env.call_method(&dex_cl, "loadClass",
-        "(Ljava/lang/String;)Ljava/lang/Class;",
-        &[(&bridge_name).into()])
-        .map_err(|e| format!("Failed to load WryBridge class: {e}"))?.l()
-        .map_err(|e| format!("Failed to unwrap class: {e}"))?;
+        let dex_cl_class = env.find_class("dalvik/system/InMemoryDexClassLoader")
+            .map_err(|e| format!("InMemoryDexClassLoader not found: {e}"))?;
+        let dex_cl = env.new_object(&dex_cl_class,
+            "(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V",
+            &[(&dex_buf).into(), (&parent_cl).into()])
+            .map_err(|e| format!("Failed to create DexClassLoader: {e}"))?;
 
-    let bridge_class_ref = jni::objects::JClass::from(bridge_class);
+        // WryBridge クラスをロード
+        let bridge_name = env.new_string("org.nicetry.wry.WryBridge")
+            .map_err(|e| format!("Failed to create string: {e}"))?;
+        let bridge_class = env.call_method(&dex_cl, "loadClass",
+            "(Ljava/lang/String;)Ljava/lang/Class;",
+            &[(&bridge_name).into()])
+            .map_err(|e| format!("Failed to load WryBridge class: {e}"))?.l()
+            .map_err(|e| format!("Failed to unwrap class: {e}"))?;
 
-    // WryBridge.init(activity)
-    env.call_static_method(&bridge_class_ref, "init",
-        "(Landroid/app/Activity;)V",
-        &[(&*activity_ref).into()])
-        .map_err(|e| format!("WryBridge.init() failed: {e}"))?;
+        let bridge_class_ref = jni::objects::JClass::from(bridge_class);
 
-    // WryBridge.createWebView(url) — ブロッキング（UI スレッドで実行）
-    let url_str = env.new_string(url)
-        .map_err(|e| format!("Failed to create URL string: {e}"))?;
-    env.call_static_method(&bridge_class_ref, "createWebView",
-        "(Ljava/lang/String;)V",
-        &[(&url_str).into()])
-        .map_err(|e| format!("WryBridge.createWebView() failed: {e}"))?;
+        // WryBridge.init(activity)
+        env.call_static_method(&bridge_class_ref, "init",
+            "(Landroid/app/Activity;)V",
+            &[(&*activity_ref).into()])
+            .map_err(|e| format!("WryBridge.init() failed: {e}"))?;
 
+        // WryBridge.createWebView(url) — ブロッキング（UI スレッドで実行）
+        let url_str = env.new_string(url)
+            .map_err(|e| format!("Failed to create URL string: {e}"))?;
+        env.call_static_method(&bridge_class_ref, "createWebView",
+            "(Ljava/lang/String;)V",
+            &[(&url_str).into()])
+            .map_err(|e| format!("WryBridge.createWebView() failed: {e}"))?;
+
+        env.new_global_ref(&bridge_class_ref)
+            .map_err(|e| format!("Failed to create global ref: {e}"))?
+    }; // env dropped, vm borrow released
+
+    let _ = ANDROID_BRIDGE.set(AndroidBridgeState { vm, bridge_class: global_class });
     godot_print!("[Godot WRY] Android WebView created via DEX bridge");
     Ok(())
 }
