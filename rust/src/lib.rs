@@ -573,6 +573,16 @@ impl WebView {
         }
     }
 
+    /// Android WebView の下部角丸を設定（デバイスピクセル単位）
+    #[func]
+    fn set_corner_radius(&self, radius: f32) {
+        #[cfg(target_os = "android")]
+        {
+            use jni::objects::JValue;
+            android_bridge_call("setCornerRadius", "(F)V", &[JValue::Float(radius)]);
+        }
+    }
+
     #[func]
     fn eval(&self, script: GString) {
         if let Some(webview) = &self.webview {
