@@ -734,6 +734,7 @@ dependencies = [
  "http",
  "jni",
  "lazy_static",
+ "libc",
  "ndk-context",
  "raw-window-handle",
  "serde_json",

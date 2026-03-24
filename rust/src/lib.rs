@@ -32,6 +32,7 @@ use {
 extern "system" {}
 
 
+
 struct GodotWRY;
 
 #[gdextension]
@@ -160,12 +161,19 @@ impl WebView {
         #[cfg(target_os = "linux")]
         gtk::init().expect("Failed to initialize GTK");
 
+        // Android: WRY の build_as_child は Android 非対応のため、DEX ブリッジ経由で直接 WebView を作成
         #[cfg(target_os = "android")]
         {
-            if let Err(e) = initialize_android_context() {
-                godot_error!("[Godot WRY] Android initialization failed: {}", e);
-                return;
+            match create_android_webview(&String::from(&self.url)) {
+                Ok(()) => {
+                    godot_print!("[Godot WRY] Android WebView created via bridge");
+                    // Android では wry::WebView は使わないが、resize/visibility は JNI 経由で行う
+                }
+                Err(e) => {
+                    godot_error!("[Godot WRY] Android WebView creation failed: {}", e);
+                }
             }
+            return;
         }
 
         let window = GodotWindow;
@@ -627,6 +635,159 @@ impl WebView {
 }
 
 #[cfg(target_os = "android")]
+static WRY_BRIDGE_DEX: &[u8] = include_bytes!("wry_bridge.dex");
+
+/// Android: JVM + Activity を取得するヘルパー
+#[cfg(target_os = "android")]
+fn get_android_jvm_and_activity() -> Result<(jni::JavaVM, jni::objects::GlobalRef), String> {
+    // Get JVM via dlsym
+    let jvm_ptr = unsafe {
+        type JniGetCreatedJavaVMsFn = unsafe extern "C" fn(
+            *mut *mut jni::sys::JavaVM, jni::sys::jsize, *mut jni::sys::jsize,
+        ) -> jni::sys::jint;
+
+        let libs = [
+            b"libnativehelper.so\0".as_ptr() as *const _,
+            b"libart.so\0".as_ptr() as *const _,
+        ];
+        let sym_name = b"JNI_GetCreatedJavaVMs\0".as_ptr() as *const _;
+        let mut func_ptr: *mut std::ffi::c_void = libc::dlsym(libc::RTLD_DEFAULT, sym_name);
+
+        if func_ptr.is_null() {
+            for lib in &libs {
+                let handle = libc::dlopen(*lib, libc::RTLD_LAZY | libc::RTLD_NOLOAD);
+                if !handle.is_null() {
+                    func_ptr = libc::dlsym(handle, sym_name);
+                    libc::dlclose(handle);
+                    if !func_ptr.is_null() { break; }
+                }
+                let handle = libc::dlopen(*lib, libc::RTLD_LAZY);
+                if !handle.is_null() {
+                    func_ptr = libc::dlsym(handle, sym_name);
+                    if !func_ptr.is_null() { break; }
+                    libc::dlclose(handle);
+                }
+            }
+        }
+        if func_ptr.is_null() {
+            return Err("Could not find JNI_GetCreatedJavaVMs".into());
+        }
+        let func: JniGetCreatedJavaVMsFn = std::mem::transmute(func_ptr);
+        let mut ptr: *mut jni::sys::JavaVM = std::ptr::null_mut();
+        let mut count: jni::sys::jsize = 0;
+        func(&mut ptr, 1, &mut count);
+        if count == 0 || ptr.is_null() {
+            return Err("No JavaVM found".into());
+        }
+        ptr
+    };
+
+    let vm = unsafe { jni::JavaVM::from_raw(jvm_ptr) }
+        .map_err(|e| format!("Failed to wrap JavaVM: {e}"))?;
+
+    let global_activity = {
+        let mut env = vm.attach_current_thread()
+            .map_err(|e| format!("Failed to attach thread: {e}"))?;
+
+        // Get Activity via ActivityThread reflection
+        let at_class = env.find_class("android/app/ActivityThread")
+            .map_err(|e| format!("Failed to find ActivityThread: {e}"))?;
+        let at_obj = env.call_static_method(&at_class, "currentActivityThread",
+            "()Landroid/app/ActivityThread;", &[])
+            .map_err(|e| format!("currentActivityThread failed: {e}"))?.l()
+            .map_err(|e| format!("Failed to get AT object: {e}"))?;
+        let activities = env.get_field(&at_obj, "mActivities", "Landroid/util/ArrayMap;")
+            .map_err(|e| format!("Failed to get mActivities: {e}"))?.l()
+            .map_err(|e| format!("Failed to unwrap mActivities: {e}"))?;
+        let values = env.call_method(&activities, "values", "()Ljava/util/Collection;", &[])
+            .map_err(|e| format!("values() failed: {e}"))?.l()
+            .map_err(|e| format!("Failed to get values: {e}"))?;
+        let array = env.call_method(&values, "toArray", "()[Ljava/lang/Object;", &[])
+            .map_err(|e| format!("toArray() failed: {e}"))?.l()
+            .map_err(|e| format!("Failed to get array: {e}"))?;
+        let arr = jni::objects::JObjectArray::from(array);
+        let arr_len = env.get_array_length(&arr).map_err(|e| format!("array length: {e}"))?;
+
+        let mut activity = jni::objects::JObject::null();
+        for i in 0..arr_len {
+            let record = env.get_object_array_element(&arr, i)
+                .map_err(|e| format!("get record[{i}]: {e}"))?;
+            let act = env.get_field(&record, "activity", "Landroid/app/Activity;")
+                .map_err(|e| format!("get activity field: {e}"))?.l()
+                .map_err(|e| format!("unwrap activity: {e}"))?;
+            if !act.is_null() { activity = act; break; }
+        }
+        if activity.is_null() {
+            return Err("No running Activity found".into());
+        }
+
+        env.new_global_ref(&activity)
+            .map_err(|e| format!("global ref: {e}"))?
+    }; // env dropped here, vm borrow released
+
+    Ok((vm, global_activity))
+}
+
+/// Android: DEX ブリッジ経由で WebView を作成
+#[cfg(target_os = "android")]
+fn create_android_webview(url: &str) -> Result<(), String> {
+    let (vm, activity_ref) = get_android_jvm_and_activity()?;
+    let mut env = vm.attach_current_thread()
+        .map_err(|e| format!("Failed to attach thread: {e}"))?;
+
+    // DEX をメモリから読み込み (InMemoryDexClassLoader, API 26+)
+    let dex_buf = unsafe {
+        env.new_direct_byte_buffer(
+            std::mem::transmute::<*const u8, *mut u8>(WRY_BRIDGE_DEX.as_ptr()),
+            WRY_BRIDGE_DEX.len(),
+        )
+    }.map_err(|e| format!("Failed to create ByteBuffer: {e}"))?;
+
+    let parent_cl_class = env.find_class("java/lang/ClassLoader")
+        .map_err(|e| format!("ClassLoader not found: {e}"))?;
+    let parent_cl = env.call_static_method(&parent_cl_class, "getSystemClassLoader",
+        "()Ljava/lang/ClassLoader;", &[])
+        .map_err(|e| format!("getSystemClassLoader failed: {e}"))?.l()
+        .map_err(|e| format!("Failed to get ClassLoader: {e}"))?;
+
+    let dex_cl_class = env.find_class("dalvik/system/InMemoryDexClassLoader")
+        .map_err(|e| format!("InMemoryDexClassLoader not found: {e}"))?;
+    let dex_cl = env.new_object(&dex_cl_class,
+        "(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V",
+        &[(&dex_buf).into(), (&parent_cl).into()])
+        .map_err(|e| format!("Failed to create DexClassLoader: {e}"))?;
+
+    // WryBridge クラスをロード
+    let bridge_name = env.new_string("org.nicetry.wry.WryBridge")
+        .map_err(|e| format!("Failed to create string: {e}"))?;
+    let bridge_class = env.call_method(&dex_cl, "loadClass",
+        "(Ljava/lang/String;)Ljava/lang/Class;",
+        &[(&bridge_name).into()])
+        .map_err(|e| format!("Failed to load WryBridge class: {e}"))?.l()
+        .map_err(|e| format!("Failed to unwrap class: {e}"))?;
+
+    let bridge_class_ref = jni::objects::JClass::from(bridge_class);
+
+    // WryBridge.init(activity)
+    env.call_static_method(&bridge_class_ref, "init",
+        "(Landroid/app/Activity;)V",
+        &[(&*activity_ref).into()])
+        .map_err(|e| format!("WryBridge.init() failed: {e}"))?;
+
+    // WryBridge.createWebView(url) — ブロッキング（UI スレッドで実行）
+    let url_str = env.new_string(url)
+        .map_err(|e| format!("Failed to create URL string: {e}"))?;
+    env.call_static_method(&bridge_class_ref, "createWebView",
+        "(Ljava/lang/String;)V",
+        &[(&url_str).into()])
+        .map_err(|e| format!("WryBridge.createWebView() failed: {e}"))?;
+
+    godot_print!("[Godot WRY] Android WebView created via DEX bridge");
+    Ok(())
+}
+
+// Legacy: ndk-context 初期化（WRY 用、Android では現在使用しない）
+#[cfg(target_os = "android")]
 fn initialize_android_context() -> Result<(), String> {
     use std::sync::atomic::{AtomicBool, Ordering};
     static INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -635,15 +796,67 @@ fn initialize_android_context() -> Result<(), String> {
         return Ok(());
     }
 
-    // 1. Get the JavaVM from the running process
-    let mut jvm_ptr: *mut jni::sys::JavaVM = std::ptr::null_mut();
-    let mut count: jni::sys::jsize = 0;
-    unsafe {
-        jni::sys::JNI_GetCreatedJavaVMs(&mut jvm_ptr, 1, &mut count);
-    }
-    if count == 0 || jvm_ptr.is_null() {
-        return Err("Could not find JavaVM in current process".into());
-    }
+    // 1. Get the JavaVM from the running process via dlsym
+    //    JNI_GetCreatedJavaVMs lives in libnativehelper.so or libart.so (not in NDK sysroot)
+    let jvm_ptr = unsafe {
+        type JniGetCreatedJavaVMsFn = unsafe extern "C" fn(
+            *mut *mut jni::sys::JavaVM,
+            jni::sys::jsize,
+            *mut jni::sys::jsize,
+        ) -> jni::sys::jint;
+
+        // Try multiple library locations where JNI_GetCreatedJavaVMs might live
+        let libs = [
+            b"libnativehelper.so\0".as_ptr() as *const _,
+            b"libart.so\0".as_ptr() as *const _,
+            b"libnativebridge.so\0".as_ptr() as *const _,
+        ];
+
+        let mut func_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        let sym_name = b"JNI_GetCreatedJavaVMs\0".as_ptr() as *const _;
+
+        // First try RTLD_DEFAULT (works if already loaded)
+        func_ptr = libc::dlsym(libc::RTLD_DEFAULT, sym_name);
+
+        // If not found, try loading specific libraries
+        if func_ptr.is_null() {
+            for lib in &libs {
+                let handle = libc::dlopen(*lib, libc::RTLD_LAZY | libc::RTLD_NOLOAD);
+                if !handle.is_null() {
+                    func_ptr = libc::dlsym(handle, sym_name);
+                    libc::dlclose(handle);
+                    if !func_ptr.is_null() {
+                        break;
+                    }
+                }
+                // Try loading it fresh
+                let handle = libc::dlopen(*lib, libc::RTLD_LAZY);
+                if !handle.is_null() {
+                    func_ptr = libc::dlsym(handle, sym_name);
+                    // Don't close - keep it loaded
+                    if !func_ptr.is_null() {
+                        break;
+                    }
+                    libc::dlclose(handle);
+                }
+            }
+        }
+
+        if func_ptr.is_null() {
+            return Err("Could not find JNI_GetCreatedJavaVMs in any library".into());
+        }
+
+        let func: JniGetCreatedJavaVMsFn = std::mem::transmute(func_ptr);
+
+        let mut jvm_ptr: *mut jni::sys::JavaVM = std::ptr::null_mut();
+        let mut count: jni::sys::jsize = 0;
+        func(&mut jvm_ptr, 1, &mut count);
+
+        if count == 0 || jvm_ptr.is_null() {
+            return Err("JNI_GetCreatedJavaVMs returned no VMs".into());
+        }
+        jvm_ptr
+    };
 
     let vm = unsafe { jni::JavaVM::from_raw(jvm_ptr) }
         .map_err(|e| format!("Failed to wrap JavaVM: {e}"))?;
