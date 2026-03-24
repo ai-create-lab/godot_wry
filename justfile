@@ -7,7 +7,7 @@ default: build
 
 set working-directory := 'rust'
 
-build: 
+build:
 	@echo "Building for {{os}} ({{target}})..."
 	@just _build-{{os}}
 	@just _copy-to-godot-{{os}}
@@ -43,7 +43,7 @@ _copy-to-godot-windows:
 	mkdir -p ../godot/addons/godot_wry/bin/{{target}}
 	cp ./target/{{target}}/release/godot_wry.dll ../godot/addons/godot_wry/bin/{{target}}/
 
-build-all: build-macos-universal build-linux build-windows
+build-all: build-macos-universal build-linux build-windows build-android build-ios
 
 build-macos-universal:
 	@echo "Building universal macOS binary..."
@@ -63,3 +63,15 @@ build-linux:
 build-windows:
 	@echo "Building for Windows..."
 	just os="windows" build
+
+build-android:
+	@echo "Building for Android (arm64-v8a)..."
+	cargo ndk -t arm64-v8a build --release
+	mkdir -p ../godot/addons/godot_wry/bin/aarch64-linux-android
+	cp ./target/aarch64-linux-android/release/libgodot_wry.so ../godot/addons/godot_wry/bin/aarch64-linux-android/
+
+build-ios:
+	@echo "Building for iOS (aarch64)..."
+	cargo rustc --target aarch64-apple-ios --release --crate-type staticlib
+	mkdir -p ../godot/addons/godot_wry/bin/aarch64-apple-ios
+	cp ./target/aarch64-apple-ios/release/libgodot_wry.a ../godot/addons/godot_wry/bin/aarch64-apple-ios/

@@ -31,6 +31,7 @@ use {
 #[link(name = "wevtapi")]
 extern "system" {}
 
+
 struct GodotWRY;
 
 #[gdextension]
@@ -158,6 +159,14 @@ impl WebView {
 
         #[cfg(target_os = "linux")]
         gtk::init().expect("Failed to initialize GTK");
+
+        #[cfg(target_os = "android")]
+        {
+            if let Err(e) = initialize_android_context() {
+                godot_error!("[Godot WRY] Android initialization failed: {}", e);
+                return;
+            }
+        }
 
         let window = GodotWindow;
 
@@ -615,6 +624,104 @@ impl WebView {
             let _ = webview.zoom(scale_factor);
         }
     }
+}
+
+#[cfg(target_os = "android")]
+fn initialize_android_context() -> Result<(), String> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+    if INITIALIZED.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+
+    // 1. Get the JavaVM from the running process
+    let mut jvm_ptr: *mut jni::sys::JavaVM = std::ptr::null_mut();
+    let mut count: jni::sys::jsize = 0;
+    unsafe {
+        jni::sys::JNI_GetCreatedJavaVMs(&mut jvm_ptr, 1, &mut count);
+    }
+    if count == 0 || jvm_ptr.is_null() {
+        return Err("Could not find JavaVM in current process".into());
+    }
+
+    let vm = unsafe { jni::JavaVM::from_raw(jvm_ptr) }
+        .map_err(|e| format!("Failed to wrap JavaVM: {e}"))?;
+    let mut env = vm.attach_current_thread()
+        .map_err(|e| format!("Failed to attach to JNI thread: {e}"))?;
+
+    // 2. Get the running Activity through ActivityThread reflection
+    //    ActivityThread.currentActivityThread().mActivities → first Activity
+    let at_class = env.find_class("android/app/ActivityThread")
+        .map_err(|e| format!("Failed to find ActivityThread class: {e}"))?;
+
+    let at_obj = env.call_static_method(
+        &at_class,
+        "currentActivityThread",
+        "()Landroid/app/ActivityThread;",
+        &[],
+    ).map_err(|e| format!("Failed to call currentActivityThread: {e}"))?
+        .l().map_err(|e| format!("Failed to get ActivityThread object: {e}"))?;
+
+    // mActivities is an ArrayMap<IBinder, ActivityClientRecord> on API 19+
+    let activities = env.get_field(&at_obj, "mActivities", "Landroid/util/ArrayMap;")
+        .map_err(|e| format!("Failed to get mActivities: {e}"))?
+        .l().map_err(|e| format!("Failed to unwrap mActivities: {e}"))?;
+
+    let values = env.call_method(&activities, "values", "()Ljava/util/Collection;", &[])
+        .map_err(|e| format!("Failed to call values(): {e}"))?
+        .l().map_err(|e| format!("Failed to get values collection: {e}"))?;
+
+    let array = env.call_method(&values, "toArray", "()[Ljava/lang/Object;", &[])
+        .map_err(|e| format!("Failed to call toArray(): {e}"))?
+        .l().map_err(|e| format!("Failed to get array: {e}"))?;
+
+    let arr = jni::objects::JObjectArray::from(array);
+    let arr_len = env.get_array_length(&arr)
+        .map_err(|e| format!("Failed to get array length: {e}"))?;
+
+    if arr_len == 0 {
+        return Err("No activities found in ActivityThread.mActivities".into());
+    }
+
+    // Find the first non-null activity from the records
+    let mut activity = jni::objects::JObject::null();
+    for i in 0..arr_len {
+        let record = env.get_object_array_element(&arr, i)
+            .map_err(|e| format!("Failed to get ActivityClientRecord[{i}]: {e}"))?;
+
+        let act = env.get_field(&record, "activity", "Landroid/app/Activity;")
+            .map_err(|e| format!("Failed to get activity field: {e}"))?
+            .l().map_err(|e| format!("Failed to unwrap activity: {e}"))?;
+
+        if !act.is_null() {
+            activity = act;
+            break;
+        }
+    }
+
+    if activity.is_null() {
+        return Err("All Activity references in mActivities are null".into());
+    }
+
+    // 3. Create a global reference (prevents GC)
+    let global_ref = env.new_global_ref(&activity)
+        .map_err(|e| format!("Failed to create global ref for Activity: {e}"))?;
+
+    // 4. Initialize ndk-context so WRY can access the JVM and Activity
+    unsafe {
+        ndk_context::initialize_android_context(
+            jvm_ptr as *mut std::ffi::c_void,
+            global_ref.as_raw() as *mut std::ffi::c_void,
+        );
+    }
+
+    // Leak the global ref to keep it alive for the process lifetime
+    std::mem::forget(global_ref);
+
+    INITIALIZED.store(true, Ordering::Relaxed);
+    godot_print!("[Godot WRY] Android context initialized successfully");
+    Ok(())
 }
 
 fn send_wheel_event(

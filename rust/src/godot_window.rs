@@ -12,7 +12,7 @@ use {
 use {
     raw_window_handle::{AppKitWindowHandle},
     std::ffi::c_void,
-    std::mem::transmute,
+    std::ptr::with_exposed_provenance_mut,
     std::ptr::NonNull,
 };
 
@@ -20,6 +20,22 @@ use {
 use {
     std::ffi::c_ulong,
     raw_window_handle::{XlibWindowHandle},
+};
+
+#[cfg(target_os = "android")]
+use {
+    raw_window_handle::AndroidNdkWindowHandle,
+    std::ffi::c_void,
+    std::ptr::with_exposed_provenance_mut,
+    std::ptr::NonNull,
+};
+
+#[cfg(target_os = "ios")]
+use {
+    raw_window_handle::UiKitWindowHandle,
+    std::ffi::c_void,
+    std::ptr::with_exposed_provenance_mut,
+    std::ptr::NonNull,
 };
 
 
@@ -47,7 +63,7 @@ impl HasWindowHandle for GodotWindow {
         unsafe {
             Ok(WindowHandle::borrow_raw(
                 RawWindowHandle::AppKit(AppKitWindowHandle::new({
-                    let ptr: *mut c_void = transmute(window_handle);
+                    let ptr: *mut c_void = with_exposed_provenance_mut(window_handle as usize);
                     NonNull::new(ptr).expect("Id<T> should never be null")
                 }))
             ))
@@ -102,6 +118,34 @@ impl HasWindowHandle for GodotWindow {
                 RawWindowHandle::Xlib(XlibWindowHandle::new({
                     window_xid as c_ulong
                 }))
+            ))
+        }
+    }
+
+    #[cfg(target_os = "android")]
+    fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
+        let display_server = DisplayServer::singleton();
+        let window_handle = display_server.window_get_native_handle(HandleType::WINDOW_HANDLE);
+        unsafe {
+            let ptr: *mut c_void = with_exposed_provenance_mut(window_handle as usize);
+            Ok(WindowHandle::borrow_raw(
+                RawWindowHandle::AndroidNdk(AndroidNdkWindowHandle::new(
+                    NonNull::new(ptr).expect("ANativeWindow should not be null")
+                ))
+            ))
+        }
+    }
+
+    #[cfg(target_os = "ios")]
+    fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
+        let display_server = DisplayServer::singleton();
+        let window_handle = display_server.window_get_native_handle(HandleType::WINDOW_VIEW);
+        unsafe {
+            let ptr: *mut c_void = with_exposed_provenance_mut(window_handle as usize);
+            Ok(WindowHandle::borrow_raw(
+                RawWindowHandle::UiKit(UiKitWindowHandle::new(
+                    NonNull::new(ptr).expect("UIView should not be null")
+                ))
             ))
         }
     }
