@@ -551,6 +551,28 @@ impl WebView {
         }
     }
 
+    /// GDScript から直接デバイスピクセル座標で WebView 位置を指定（Android 用）
+    #[func]
+    fn set_bounds_device_px(&self, x: i32, y: i32, w: i32, h: i32) {
+        #[cfg(target_os = "android")]
+        {
+            use jni::objects::JValue;
+            android_bridge_call("setBounds", "(IIII)V", &[
+                JValue::Int(x), JValue::Int(y), JValue::Int(w), JValue::Int(h),
+            ]);
+            return;
+        }
+
+        #[cfg(not(target_os = "android"))]
+        if let Some(webview) = &self.webview {
+            let rect = Rect {
+                position: PhysicalPosition::new(x, y).into(),
+                size: PhysicalSize::new(w, h).into(),
+            };
+            let _ = webview.set_bounds(rect);
+        }
+    }
+
     #[func]
     fn eval(&self, script: GString) {
         if let Some(webview) = &self.webview {
