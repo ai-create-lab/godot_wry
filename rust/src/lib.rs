@@ -632,12 +632,14 @@ impl WebView {
 
         #[cfg(target_os = "android")]
         {
-            if let Some(state) = ANDROID_BRIDGE.get() {
-                if let Ok(mut env) = state.vm.attach_current_thread() {
-                    let cls = unsafe { jni::objects::JClass::from_raw(state.bridge_class.as_raw()) };
-                    if let Ok(jurl) = env.new_string(&url_str) {
-                        let _ = env.call_static_method(cls, "loadUrl",
-                            "(Ljava/lang/String;)V", &[(&jurl).into()]);
+            if let Ok(guard) = ANDROID_BRIDGE.lock() {
+                if let Some(state) = guard.as_ref() {
+                    if let Ok(mut env) = state.vm.attach_current_thread() {
+                        let cls = unsafe { jni::objects::JClass::from_raw(state.bridge_class.as_raw()) };
+                        if let Ok(jurl) = env.new_string(&url_str) {
+                            let _ = env.call_static_method(cls, "loadUrl",
+                                "(Ljava/lang/String;)V", &[(&jurl).into()]);
+                        }
                     }
                 }
             }
@@ -719,7 +721,7 @@ impl WebView {
 static WRY_BRIDGE_DEX: &[u8] = include_bytes!("wry_bridge.dex");
 
 #[cfg(target_os = "android")]
-static ANDROID_BRIDGE: std::sync::OnceLock<AndroidBridgeState> = std::sync::OnceLock::new();
+static ANDROID_BRIDGE: std::sync::Mutex<Option<AndroidBridgeState>> = std::sync::Mutex::new(None);
 
 #[cfg(target_os = "android")]
 struct AndroidBridgeState {
@@ -734,11 +736,13 @@ unsafe impl Sync for AndroidBridgeState {}
 
 #[cfg(target_os = "android")]
 fn android_bridge_call(method: &str, sig: &str, args: &[jni::objects::JValue]) {
-    if let Some(state) = ANDROID_BRIDGE.get() {
-        if let Ok(mut env) = state.vm.attach_current_thread() {
-            let cls = unsafe { jni::objects::JClass::from_raw(state.bridge_class.as_raw()) };
-            if let Err(e) = env.call_static_method(cls, method, sig, args) {
-                godot_error!("[Godot WRY] Android bridge call {method} failed: {e}");
+    if let Ok(guard) = ANDROID_BRIDGE.lock() {
+        if let Some(state) = guard.as_ref() {
+            if let Ok(mut env) = state.vm.attach_current_thread() {
+                let cls = unsafe { jni::objects::JClass::from_raw(state.bridge_class.as_raw()) };
+                if let Err(e) = env.call_static_method(cls, method, sig, args) {
+                    godot_error!("[Godot WRY] Android bridge call {method} failed: {e}");
+                }
             }
         }
     }
@@ -895,7 +899,7 @@ fn create_android_webview(url: &str) -> Result<(), String> {
             .map_err(|e| format!("Failed to create global ref: {e}"))?
     }; // env dropped, vm borrow released
 
-    let _ = ANDROID_BRIDGE.set(AndroidBridgeState { vm, bridge_class: global_class });
+    *ANDROID_BRIDGE.lock().unwrap() = Some(AndroidBridgeState { vm, bridge_class: global_class });
     godot_print!("[Godot WRY] Android WebView created via DEX bridge");
     Ok(())
 }
