@@ -7,7 +7,7 @@ edition = "2021"
 crate-type = ["cdylib"]  # Compile this crate to a dynamic C library.
 
 [dependencies]
-godot = { git = "https://github.com/godot-rust/gdext", branch = "master", features = ["api-4-1"] }
+godot = { git = "https://github.com/godot-rust/gdext", branch = "master", features = ["experimental-threads"] }
 raw-window-handle = "0.6.2"
 wry = { version = "0.50.4", features = ["transparent", "devtools"] }
 http = "1.1.0"
@@ -22,3 +22,6 @@ windows = { version = "0.61.1", features = ["Win32", "Win32_UI", "Win32_UI_Windo
 jni = "0.21"
 ndk-context = "0.1"
 libc = "0.2"
+[target.'cfg(target_os = "ios")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSURLRequest", "NSURL", "NSString"] }

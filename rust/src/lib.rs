@@ -5,6 +5,7 @@ use godot::global::MouseButtonMask;
 use godot::init::*;
 use godot::prelude::*;
 use godot::classes::{Control, DisplayServer, IControl, Input, InputEventMouseButton, InputEventMouseMotion, InputEventKey, ProjectSettings};
+use godot::obj::Singleton;
 use godot::global::{Key, MouseButton};
 use lazy_static::lazy_static;
 use serde_json;
@@ -35,7 +36,7 @@ extern "system" {}
 
 struct GodotWRY;
 
-#[gdextension]
+#[gdextension(entry_symbol = gdext_wry_init)]
 unsafe impl ExtensionLibrary for GodotWRY {}
 
 #[derive(GodotClass)]
@@ -46,6 +47,8 @@ struct WebView {
     previous_screen_position: Vector2,
     previous_viewport_size: Vector2i,
     previous_window_position: Vector2i,
+    /// When true, `update_webview` auto-resize is disabled (manual bounds via set_bounds_device_px).
+    manual_bounds: bool,
     #[export]
     full_window_size: bool,
     #[export]
@@ -61,7 +64,7 @@ struct WebView {
     #[export]
     devtools: bool,
     #[export]
-    headers: Dictionary,
+    headers: Dictionary<Variant, Variant>,
     #[export]
     user_agent: GString,
     #[export]
@@ -87,6 +90,7 @@ impl IControl for WebView {
             previous_screen_position: Vector2::default(),
             previous_viewport_size: Vector2i::default(),
             previous_window_position: Vector2i::default(),
+            manual_bounds: false,
             full_window_size: true,
             url: "https://github.com/doceazedo/godot_wry".into(),
             html: "".into(),
@@ -128,18 +132,21 @@ impl WebView {
     #[func]
     fn update_webview(&mut self) {
         if let Some(_) = &self.webview {
-            let viewport_size = self.base().get_tree().expect("Could not get tree").get_root().expect("Could not get viewport").get_size();
-            let window_position = DisplayServer::singleton().window_get_position();
+            // manual_bounds モードでは GDScript が set_bounds_device_px で制御するため自動リサイズしない
+            if !self.manual_bounds {
+                let viewport_size = self.base().get_tree().get_root().expect("Could not get viewport").get_size();
+                let window_position = DisplayServer::singleton().window_get_position();
 
-            let needs_resize = self.base().get_screen_position() != self.previous_screen_position
-                || viewport_size != self.previous_viewport_size
-                || window_position != self.previous_window_position;
+                let needs_resize = self.base().get_screen_position() != self.previous_screen_position
+                    || viewport_size != self.previous_viewport_size
+                    || window_position != self.previous_window_position;
 
-            if needs_resize {
-                self.previous_screen_position = self.base().get_screen_position();
-                self.previous_viewport_size = viewport_size;
-                self.previous_window_position = window_position;
-                self.resize();
+                if needs_resize {
+                    self.previous_screen_position = self.base().get_screen_position();
+                    self.previous_viewport_size = viewport_size;
+                    self.previous_window_position = window_position;
+                    self.resize();
+                }
             }
 
             #[cfg(target_os = "linux")]
@@ -152,7 +159,7 @@ impl WebView {
     #[func]
     fn create_webview(&mut self) {
         let display_server = DisplayServer::singleton();
-        if display_server.get_name() == "headless".into()
+        if display_server.get_name() == "headless"
         {
             godot_warn!("Godot WRY: Headless mode detected. webview will not be created.");
             return;
@@ -167,7 +174,6 @@ impl WebView {
             match create_android_webview(&String::from(&self.url)) {
                 Ok(()) => {
                     godot_print!("[Godot WRY] Android WebView created via bridge");
-                    // Android では wry::WebView は使わないが、resize/visibility は JNI 経由で行う
                 }
                 Err(e) => {
                     godot_error!("[Godot WRY] Android WebView creation failed: {}", e);
@@ -176,6 +182,23 @@ impl WebView {
             return;
         }
 
+        // iOS: WRY の set_bounds が効かないため、objc2 で直接 WKWebView を管理
+        #[cfg(target_os = "ios")]
+        {
+            match create_ios_webview(&String::from(&self.url)) {
+                Ok(()) => {
+                    godot_print!("[Godot WRY] iOS WKWebView created");
+                }
+                Err(e) => {
+                    godot_error!("[Godot WRY] iOS WKWebView creation failed: {}", e);
+                }
+            }
+            return;
+        }
+
+        // デスクトップ: WRY の build_as_child を使用（iOS/Android は上で early return）
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        {
         let window = GodotWindow;
 
         // remove WS_CLIPCHILDREN from the window style
@@ -406,7 +429,7 @@ impl WebView {
         let webview = webview_builder.build_as_child(&window).unwrap();
         self.webview.replace(webview);
 
-        let mut viewport = self.base().get_tree().expect("Could not get tree").get_root().expect("Could not get viewport");
+        let mut viewport = self.base().get_tree().get_root().expect("Could not get viewport");
         viewport.connect("size_changed", &Callable::from_object_method(&*self.base(), "resize"));
 
         self.base().clone().connect("resized", &Callable::from_object_method(&*self.base(), "resize"));
@@ -493,6 +516,7 @@ impl WebView {
         }
 
         self.resize()
+        } // #[cfg(not(any(target_os = "android", target_os = "ios")))]
     }
 
     #[func]
@@ -507,7 +531,7 @@ impl WebView {
     #[func]
     fn resize(&self) {
         let (x, y, w, h) = if self.full_window_size {
-            let viewport_size = self.base().get_tree().expect("Could not get tree").get_root().expect("Could not get viewport").get_size();
+            let viewport_size = self.base().get_tree().get_root().expect("Could not get viewport").get_size();
             (0, 0, viewport_size.x, viewport_size.y)
         } else {
             let pos = self.base().get_screen_position();
@@ -551,9 +575,10 @@ impl WebView {
         }
     }
 
-    /// GDScript から直接デバイスピクセル座標で WebView 位置を指定（Android 用）
+    /// GDScript から直接デバイスピクセル座標で WebView 位置を指定
     #[func]
-    fn set_bounds_device_px(&self, x: i32, y: i32, w: i32, h: i32) {
+    fn set_bounds_device_px(&mut self, x: i32, y: i32, w: i32, h: i32) {
+        self.manual_bounds = true;
         #[cfg(target_os = "android")]
         {
             use jni::objects::JValue;
@@ -563,7 +588,13 @@ impl WebView {
             return;
         }
 
-        #[cfg(not(target_os = "android"))]
+        #[cfg(target_os = "ios")]
+        {
+            ios_set_bounds(x as f64, y as f64, w as f64, h as f64);
+            return;
+        }
+
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         if let Some(webview) = &self.webview {
             let rect = Rect {
                 position: PhysicalPosition::new(x, y).into(),
@@ -585,6 +616,13 @@ impl WebView {
 
     #[func]
     fn eval(&self, script: GString) {
+        #[cfg(target_os = "ios")]
+        {
+            ios_eval(&String::from(script));
+            return;
+        }
+
+        #[cfg(not(target_os = "ios"))]
         if let Some(webview) = &self.webview {
             let _ = webview.evaluate_script(&*String::from(script));
         }
@@ -608,7 +646,13 @@ impl WebView {
             return;
         }
 
-        #[cfg(not(target_os = "android"))]
+        #[cfg(target_os = "ios")]
+        {
+            ios_set_visible(visibility);
+            return;
+        }
+
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         if let Some(webview) = &self.webview {
             let _ = webview.set_visible(visibility);
         }
@@ -646,7 +690,13 @@ impl WebView {
             return;
         }
 
-        #[cfg(not(target_os = "android"))]
+        #[cfg(target_os = "ios")]
+        {
+            ios_load_url(&url_str);
+            return;
+        }
+
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         if let Some(webview) = &self.webview {
             let _ = webview.load_url(&url_str);
         }
@@ -1269,4 +1319,217 @@ lazy_static! {
         ("/", Key::SLASH),
         ("?", Key::QUESTION),
     ]);
+}
+
+// ── iOS: WKWebView 直接管理（objc2 ランタイム API）─────────────────────
+#[cfg(target_os = "ios")]
+use std::sync::Mutex as StdMutex;
+
+/// CGRect for iOS objc messaging
+#[cfg(target_os = "ios")]
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+struct IOSCGRect { x: f64, y: f64, w: f64, h: f64 }
+
+#[cfg(target_os = "ios")]
+unsafe impl objc2::encode::Encode for IOSCGRect {
+    const ENCODING: objc2::encode::Encoding = objc2::encode::Encoding::Struct(
+        "CGRect",
+        &[
+            objc2::encode::Encoding::Struct("CGPoint", &[objc2::encode::Encoding::Double, objc2::encode::Encoding::Double]),
+            objc2::encode::Encoding::Struct("CGSize", &[objc2::encode::Encoding::Double, objc2::encode::Encoding::Double]),
+        ],
+    );
+}
+
+/// Raw pointer to WKWebView instance (Send+Sync wrapper)
+#[cfg(target_os = "ios")]
+struct WKWebViewPtr(*mut objc2::runtime::AnyObject);
+#[cfg(target_os = "ios")]
+unsafe impl Send for WKWebViewPtr {}
+#[cfg(target_os = "ios")]
+unsafe impl Sync for WKWebViewPtr {}
+
+#[cfg(target_os = "ios")]
+static IOS_WEBVIEW: StdMutex<Option<WKWebViewPtr>> = StdMutex::new(None);
+
+#[cfg(target_os = "ios")]
+fn create_ios_webview(url: &str) -> Result<(), String> {
+    use objc2::runtime::AnyClass;
+    ios_log(&format!("create_ios_webview START: url={url}"));
+
+    unsafe {
+        // 初期フレーム: 小サイズ（set_bounds_device_px で正しいサイズに変更される）
+        let frame = IOSCGRect { x: 0.0, y: 0.0, w: 1.0, h: 1.0 };
+        ios_log("creating WKWebViewConfiguration...");
+
+        // WKWebViewConfiguration.alloc.init
+        let config_cls = AnyClass::get(c"WKWebViewConfiguration")
+            .ok_or("WKWebViewConfiguration class not found")?;
+        let config: *mut objc2::runtime::AnyObject = objc2::msg_send![config_cls, alloc];
+        let config: *mut objc2::runtime::AnyObject = objc2::msg_send![config, init];
+
+        // WKWebView.alloc.initWithFrame:configuration:
+        let wk_cls = AnyClass::get(c"WKWebView")
+            .ok_or("WKWebView class not found")?;
+        let wv: *mut objc2::runtime::AnyObject = objc2::msg_send![wk_cls, alloc];
+        let wv: *mut objc2::runtime::AnyObject = objc2::msg_send![wv, initWithFrame: frame configuration: config];
+
+        // autoresizing 無効化
+        let _: () = objc2::msg_send![wv, setAutoresizingMask: 0u64];
+
+        // 背景色を Web ページの背景 #1a1a22 に合わせる（ちらつき防止）
+        let ui_color_cls = objc2::runtime::AnyClass::get(c"UIColor").unwrap();
+        let bg_color: *mut objc2::runtime::AnyObject = objc2::msg_send![
+            ui_color_cls, colorWithRed: 0.102_f64 green: 0.102_f64 blue: 0.133_f64 alpha: 1.0_f64
+        ];
+        let _: () = objc2::msg_send![wv, setBackgroundColor: bg_color];
+        let _: () = objc2::msg_send![wv, setOpaque: false];
+        let _: () = objc2::msg_send![wv, setClipsToBounds: true];
+
+        // Godot の UIView に追加
+        let display_server = godot::classes::DisplayServer::singleton();
+        let view_ptr = display_server.window_get_native_handle(
+            godot::classes::display_server::HandleType::WINDOW_VIEW,
+        );
+        if view_ptr != 0 {
+            let parent: *mut objc2::runtime::AnyObject =
+                std::ptr::with_exposed_provenance_mut(view_ptr as usize);
+            let _: () = objc2::msg_send![parent, addSubview: wv];
+        }
+
+        // 初期非表示（set_visible で表示）
+        let _: () = objc2::msg_send![wv, setHidden: true];
+
+        // URL ロード
+        if !url.is_empty() && url != "about:blank" {
+            let ns_str_cls = AnyClass::get(c"NSString").unwrap();
+            let url_bytes = url.as_bytes();
+            let ns_url_str: *mut objc2::runtime::AnyObject = objc2::msg_send![
+                ns_str_cls,
+                stringWithUTF8String: url_bytes.as_ptr() as *const std::ffi::c_char
+            ];
+            let nsurl_cls = AnyClass::get(c"NSURL").unwrap();
+            let ns_url: *mut objc2::runtime::AnyObject = objc2::msg_send![nsurl_cls, URLWithString: ns_url_str];
+            let req_cls = AnyClass::get(c"NSURLRequest").unwrap();
+            let req: *mut objc2::runtime::AnyObject = objc2::msg_send![req_cls, requestWithURL: ns_url];
+            let _: *mut objc2::runtime::AnyObject = objc2::msg_send![wv, loadRequest: req];
+        }
+
+        // retain して保持
+        let _: *mut objc2::runtime::AnyObject = objc2::msg_send![wv, retain];
+        *IOS_WEBVIEW.lock().unwrap() = Some(WKWebViewPtr(wv));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "ios")]
+fn ios_set_bounds(x: f64, y: f64, w: f64, h: f64) {
+    if let Some(wv) = IOS_WEBVIEW.lock().unwrap().as_ref() {
+        unsafe {
+            // デバイスピクセル → ポイント変換（UIScreen.scale で割る）
+            let ui_screen_cls = objc2::runtime::AnyClass::get(c"UIScreen").unwrap();
+            let main_screen: *mut objc2::runtime::AnyObject = objc2::msg_send![ui_screen_cls, mainScreen];
+            let scale: f64 = objc2::msg_send![main_screen, scale];
+
+            let frame = IOSCGRect {
+                x: x / scale,
+                y: y / scale,
+                w: w / scale,
+                h: h / scale,
+            };
+
+            // autoresizing mask を無効化
+            let _: () = objc2::msg_send![wv.0, setTranslatesAutoresizingMaskIntoConstraints: true];
+            let _: () = objc2::msg_send![wv.0, setAutoresizingMask: 0u64];
+
+            // setFrame: で位置・サイズ設定（ポイント単位）
+            let _: () = objc2::msg_send![wv.0, setFrame: frame];
+
+            // 角丸（下側のみ — ヘッダーとの境目を段差にしない）
+            let layer: *mut objc2::runtime::AnyObject = objc2::msg_send![wv.0, layer];
+            let _: () = objc2::msg_send![layer, setCornerRadius: 16.0_f64];
+            let _: () = objc2::msg_send![layer, setMasksToBounds: true];
+            // CACornerMask: bottomLeft(8) | bottomRight(4) = 12
+            let _: () = objc2::msg_send![layer, setMaskedCorners: 12u64];
+        }
+        godot::prelude::godot_print!("[Godot WRY] iOS setFrame (pts): ({},{},{},{}) scale={}",
+            x, y, w, h, 0.0); // scale printed separately to avoid borrowing issues
+    }
+}
+
+#[cfg(target_os = "ios")]
+fn ios_eval(script: &str) {
+    if let Some(wv) = IOS_WEBVIEW.lock().unwrap().as_ref() {
+        unsafe {
+            let ns_str_cls = objc2::runtime::AnyClass::get(c"NSString").unwrap();
+            let c_str = std::ffi::CString::new(script).unwrap();
+            let ns_script: *mut objc2::runtime::AnyObject = objc2::msg_send![
+                ns_str_cls, stringWithUTF8String: c_str.as_ptr()
+            ];
+            // evaluateJavaScript:completionHandler:
+            let _: () = objc2::msg_send![wv.0, evaluateJavaScript: ns_script completionHandler: std::ptr::null::<objc2::runtime::AnyObject>()];
+        }
+    }
+}
+
+#[cfg(target_os = "ios")]
+fn ios_set_visible(visible: bool) {
+    ios_log(&format!("ios_set_visible: {visible}"));
+    if let Some(wv) = IOS_WEBVIEW.lock().unwrap().as_ref() {
+        unsafe {
+            let _: () = objc2::msg_send![wv.0, setHidden: !visible];
+        }
+    }
+}
+
+fn ios_log(msg: &str) {
+    use std::io::Write;
+    // NSHomeDirectory を objc 経由で取得
+    let home: String = unsafe {
+        let cls = objc2::runtime::AnyClass::get(c"NSHomeDirectory");
+        if let Some(_) = cls {
+            // NSHomeDirectory() はC関数 — NSProcessInfo から取得
+            let pi_cls = objc2::runtime::AnyClass::get(c"NSProcessInfo").unwrap();
+            let pi: *mut objc2::runtime::AnyObject = objc2::msg_send![pi_cls, processInfo];
+            let env: *mut objc2::runtime::AnyObject = objc2::msg_send![pi, environment];
+            let key_cls = objc2::runtime::AnyClass::get(c"NSString").unwrap();
+            let key: *mut objc2::runtime::AnyObject = objc2::msg_send![key_cls, stringWithUTF8String: c"HOME".as_ptr()];
+            let val: *mut objc2::runtime::AnyObject = objc2::msg_send![env, objectForKey: key];
+            if !val.is_null() {
+                let cstr: *const std::ffi::c_char = objc2::msg_send![val, UTF8String];
+                std::ffi::CStr::from_ptr(cstr).to_string_lossy().to_string()
+            } else {
+                "/var/mobile".to_string()
+            }
+        } else {
+            "/var/mobile".to_string()
+        }
+    };
+    let path = format!("{}/Documents/wry_debug.log", home);
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "{msg}");
+    }
+}
+
+#[cfg(target_os = "ios")]
+fn ios_load_url(url: &str) {
+    use objc2::runtime::AnyClass;
+
+    if let Some(wv) = IOS_WEBVIEW.lock().unwrap().as_ref() {
+        unsafe {
+            let ns_str_cls = AnyClass::get(c"NSString").unwrap();
+            let c_str = std::ffi::CString::new(url).unwrap();
+            let ns_url_str: *mut objc2::runtime::AnyObject = objc2::msg_send![
+                ns_str_cls, stringWithUTF8String: c_str.as_ptr()
+            ];
+            let nsurl_cls = AnyClass::get(c"NSURL").unwrap();
+            let ns_url: *mut objc2::runtime::AnyObject = objc2::msg_send![nsurl_cls, URLWithString: ns_url_str];
+            if !ns_url.is_null() {
+                let req_cls = AnyClass::get(c"NSURLRequest").unwrap();
+                let req: *mut objc2::runtime::AnyObject = objc2::msg_send![req_cls, requestWithURL: ns_url];
+                let _: *mut objc2::runtime::AnyObject = objc2::msg_send![wv.0, loadRequest: req];
+            }
+        }
+    }
 }
