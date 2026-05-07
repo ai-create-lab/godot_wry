@@ -1483,6 +1483,7 @@ fn ios_set_visible(visible: bool) {
     }
 }
 
+#[cfg(target_os = "ios")]
 fn ios_log(msg: &str) {
     use std::io::Write;
     // NSHomeDirectory を objc 経由で取得
